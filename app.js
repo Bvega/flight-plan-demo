@@ -14,7 +14,12 @@ const APP = {
   langKey: "fp_lang",
   stateKey: "fp_state_v1",
   defaultLang: "en",
-  baseUrlOverrideKey: "fp_base_url_override"
+
+  // Manual override set by user (Presenter UI)
+  baseUrlOverrideKey: "fp_base_url_override",
+
+  // Auto-detected LAN base URL (from /api/lan)
+  baseUrlDetectedKey: "fp_base_url_detected"
 };
 
 const i18n = {
@@ -124,7 +129,7 @@ const i18n = {
 
 const steps = [
   { id: 1, colorVar: "--c1", icon: "⏳", en: "Waiting Room",            es: "Sala de espera" },
-  { id: 2, colorVar: "--c2", icon: "🧾", en: "Pre‑Procedure / Holding", es: "Pre‑procedimiento / Preparación" },
+  { id: 2, colorVar: "--c2", icon: "🧾", en: "Pre-Procedure / Holding", es: "Pre-procedimiento / Preparación" },
   { id: 3, colorVar: "--c3", icon: "🏥", en: "In Procedure (OR)",       es: "En procedimiento (Quirófano)" },
   { id: 4, colorVar: "--c4", icon: "▶️", en: "Procedure Started",       es: "Procedimiento iniciado" },
   { id: 5, colorVar: "--c5", icon: "⏹️", en: "Procedure Ended",         es: "Procedimiento finalizado" },
@@ -157,6 +162,10 @@ if(bc){
 
 // Cross-device LAN sync
 function isHttpOrigin(){ return location.origin && location.origin.startsWith("http"); }
+function isLocalhostHost(){
+  const h = (location.hostname || "").toLowerCase();
+  return h === "localhost" || h === "127.0.0.1";
+}
 
 async function serverGetState(){
   if(!isHttpOrigin()) return null;
@@ -195,6 +204,35 @@ function startSse(){
   }catch(e){}
 }
 
+/**
+ * If running on localhost AND user hasn't overridden the base URL,
+ * ask the local server for LAN IP candidates and store a detected base URL.
+ */
+async function ensureDetectedLanBaseUrl(){
+  if(!isHttpOrigin()) return;
+  if(!isLocalhostHost()) return;
+
+  const override = localStorage.getItem(APP.baseUrlOverrideKey);
+  if(override && override.trim()) return;
+
+  const detected = localStorage.getItem(APP.baseUrlDetectedKey);
+  if(detected && detected.trim()) return;
+
+  try{
+    const res = await fetch("/api/lan", { cache:"no-store" });
+    if(!res.ok) return;
+    const data = await res.json();
+    const ips = Array.isArray(data.ips) ? data.ips : [];
+    const port = data.port || 8000;
+
+    const ip = ips.find(Boolean);
+    if(!ip) return;
+
+    const lan = `http://${ip}:${port}`;
+    localStorage.setItem(APP.baseUrlDetectedKey, lan);
+  }catch(e){}
+}
+
 function setLang(lang){
   localStorage.setItem(APP.langKey, lang);
   broadcast({ type:"lang", lang });
@@ -224,7 +262,7 @@ function loadState(){
 function saveState(state){
   localStorage.setItem(APP.stateKey, JSON.stringify(state));
   broadcast({ type:"state", state });
-  serverPushState(state); // <-- phone sync
+  serverPushState(state);
 }
 
 function parseRoute(){
@@ -237,12 +275,24 @@ function parseRoute(){
   return { view:"home" };
 }
 
+/**
+ * Base URL used to build scannable QR links.
+ * Priority:
+ * 1) Manual override from Presenter UI
+ * 2) Auto-detected LAN base URL (from /api/lan) when running on localhost
+ * 3) Current origin (when already on LAN host)
+ */
 function baseUrl(){
   const override = localStorage.getItem(APP.baseUrlOverrideKey);
-  if(override) return override.replace(/\/$/,'');
-  if(location.origin && location.origin.startsWith("http")) return location.origin;
-  return "http://localhost:8000";
+  if(override && override.trim()) return override.trim().replace(/\/$/,'');
+
+  const detected = localStorage.getItem(APP.baseUrlDetectedKey);
+  if(detected && detected.trim()) return detected.trim().replace(/\/$/,'');
+
+  if(location.origin && location.origin.startsWith("http")) return location.origin.replace(/\/$/,'');
+  return "";
 }
+
 function familyUrl(code){
   return `${baseUrl()}/#/f/${encodeURIComponent(code)}`;
 }
@@ -261,7 +311,7 @@ function el(tag, attrs={}, children=[]){
   for(const [k,v] of Object.entries(attrs)){
     if(k==="class") node.className = v;
     else if(k.startsWith("on") && typeof v === "function") node.addEventListener(k.slice(2), v);
-    else node.setAttribute(k, v);
+    else if(v !== null && v !== undefined) node.setAttribute(k, v);
   }
   for(const child of children){
     if(child===null || child===undefined) continue;
@@ -277,7 +327,6 @@ function topbar(view){
     el("option", { value:"es", selected: lang==="es" ? "selected":null }, ["ES"])
   ]);
 
-  // Compact header for Family/Phone view: keep it minimal so content fits.
   const compact = (view === "family");
 
   const actionButtons = compact
@@ -431,19 +480,54 @@ async function copyToClipboard(text){
     document.execCommand("copy"); document.body.removeChild(ta); return true;
   }
 }
-function qrImgFor(code){ return `assets/qr_${code}.png`; }
+
+/**
+ * Dynamic QR image source built from the ACTUAL link we want to open.
+ * This fixes the issue where old static PNGs still encode localhost.
+ *
+ * Uses a simple QR image endpoint that returns a QR PNG.
+ * If the network blocks it, the "Copy link" button still works.
+ */
+function qrImgSrcForLink(link){
+  const size = 260; // a bit larger for camera readability
+  return `https://api.qrserver.com/v1/create-qr-code/?size=${size}x${size}&data=${encodeURIComponent(link)}`;
+}
 
 function viewPresenter(root){
   const st = loadState();
   const codes = Object.keys(st.cases).sort();
 
-  const baseInput = el("input", { class:"input", value: localStorage.getItem(APP.baseUrlOverrideKey) || "", placeholder:"http://192.168.1.25:8000" });
+  const overrideVal = localStorage.getItem(APP.baseUrlOverrideKey) || "";
+  const detectedVal = localStorage.getItem(APP.baseUrlDetectedKey) || "";
+  const suggested = (overrideVal || detectedVal || "").trim();
+
+  const baseInput = el("input", {
+    class:"input",
+    value: suggested,
+    placeholder: detectedVal ? detectedVal : "http://192.168.1.25:8000"
+  });
+
+  const useDetectedBtn = el("button", {
+    class:"btn",
+    onclick:()=>{
+      const d = (localStorage.getItem(APP.baseUrlDetectedKey) || "").trim();
+      if(!d) return;
+      localStorage.setItem(APP.baseUrlOverrideKey, d.replace(/\/$/,''));
+      render();
+    }
+  }, [ "✨ Use detected" ]);
+
   const saveBaseBtn = el("button", { class:"btn primary", onclick:()=>{
     const v = baseInput.value.trim();
     if(v) localStorage.setItem(APP.baseUrlOverrideKey, v.replace(/\/$/,''));
     else localStorage.removeItem(APP.baseUrlOverrideKey);
     render();
   }}, [ t("save") ]);
+
+  const clearBaseBtn = el("button", { class:"btn", onclick:()=>{
+    localStorage.removeItem(APP.baseUrlOverrideKey);
+    render();
+  }}, [ "Clear" ]);
 
   const newCode = el("input", { class:"input", placeholder:"B0200" });
   const createBtn = el("button", { class:"btn primary", onclick:()=>{
@@ -505,16 +589,41 @@ function viewPresenter(root){
     qrBox.innerHTML = "";
     const code = caseSelect.value || "B0170";
     const link = familyUrl(code);
-    const img = el("img", { src: qrImgFor(code), style:"width:220px; height:220px; border-radius:16px; border:1px solid var(--border); background:#fff;" });
-    img.onerror = ()=>{ img.style.display="none"; };
+
+    const img = el("img", {
+      src: qrImgSrcForLink(link),
+      alt: `QR for ${code}`,
+      style:"width:260px; height:260px; border-radius:16px; border:1px solid var(--border); background:#fff;"
+    });
+
     const copyBtn = el("button", { class:"btn", onclick:()=>copyToClipboard(link) }, [ "📋 ", t("copyLink") ]);
     const openBtn = el("a", { class:"btn primary", href:`#/f/${encodeURIComponent(code)}` }, [ "📱 ", t("open") ]);
 
-    qrBox.appendChild(el("div", { class:"panelTitle" }, [ el("h3", {}, [ `${t("qrForCase")} ${code}` ]), el("div", { class:"smallNote" }, [ link ]) ]));
-    qrBox.appendChild(el("div", { class:"row" }, [ img, el("div", { style:"min-width:260px; max-width:520px" }, [
-      el("div", { class:"notice" }, [ el("div", { class:"kicker" }, [ t("baseUrl") ]), el("div", { class:"smallNote", style:"margin-top:6px" }, [ link ]) ]),
-      el("div", { class:"row", style:"margin-top:10px" }, [ copyBtn, openBtn ])
-    ]) ]));
+    const warn = (isLocalhostHost() && !(localStorage.getItem(APP.baseUrlOverrideKey) || "").trim())
+      ? el("div", { class:"notice", style:"margin-top:10px" }, [
+          el("div", { class:"kicker" }, [ "LAN QR Tip" ]),
+          el("div", { class:"smallNote", style:"margin-top:6px" }, [
+            "Scanning must use your LAN IP (not localhost). Use “Use detected” or paste your LAN URL above and Save."
+          ])
+        ])
+      : null;
+
+    qrBox.appendChild(el("div", { class:"panelTitle" }, [
+      el("h3", {}, [ `${t("qrForCase")} ${code}` ]),
+      el("div", { class:"smallNote" }, [ link ])
+    ]));
+
+    qrBox.appendChild(el("div", { class:"row" }, [
+      img,
+      el("div", { style:"min-width:260px; max-width:520px" }, [
+        el("div", { class:"notice" }, [
+          el("div", { class:"kicker" }, [ t("baseUrl") ]),
+          el("div", { class:"smallNote", style:"margin-top:6px" }, [ link ])
+        ]),
+        el("div", { class:"row", style:"margin-top:10px" }, [ copyBtn, openBtn ]),
+        warn
+      ])
+    ]));
   }
   caseSelect.addEventListener("change", refreshQr);
 
@@ -526,7 +635,17 @@ function viewPresenter(root){
         el("div", { style:"height:14px" }),
         el("div", { class:"notice" }, [
           el("div", { class:"kicker" }, [ t("baseUrl") ]),
-          el("div", { class:"row", style:"margin-top:8px" }, [ baseInput, saveBaseBtn ])
+          el("div", { class:"row", style:"margin-top:8px" }, [
+            baseInput,
+            saveBaseBtn,
+            clearBaseBtn,
+            detectedVal ? useDetectedBtn : null
+          ].filter(Boolean)),
+          detectedVal ? el("div", { class:"smallNote", style:"margin-top:8px" }, [
+            `Detected: ${detectedVal}`
+          ]) : el("div", { class:"smallNote", style:"margin-top:8px" }, [
+            "No LAN IP detected yet. Run: node server.js (so /api/lan is available)."
+          ])
         ]),
         el("div", { style:"height:14px" }),
         el("div", { class:"notice" }, [
@@ -561,7 +680,7 @@ function render(){
   const body = el("div", { id:"view" });
   appRoot.appendChild(body);
 
-if(route.view==="home") viewHome(body);
+  if(route.view==="home") viewHome(body);
   if(route.view==="family") viewFamily(body, route.code);
   if(route.view==="display") viewDisplay(body);
   if(route.view==="presenter") viewPresenter(body);
@@ -569,7 +688,8 @@ if(route.view==="home") viewHome(body);
 
 window.addEventListener("hashchange", render);
 window.addEventListener("load", async ()=>{
-  // Hydrate from server state if available; otherwise seed and push once.
+  await ensureDetectedLanBaseUrl();
+
   const st = await serverGetState();
   if(st){
     localStorage.setItem(APP.stateKey, JSON.stringify(st));
