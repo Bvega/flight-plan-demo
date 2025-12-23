@@ -1,0 +1,45 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Demo: Start server (node server.js)",
+      "type": "shell",
+      "command": "node",
+      "args": ["server.js"],
+      "group": "build",
+      "isBackground": true,
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": [
+        {
+          "owner": "demo-server",
+          "pattern": [
+            {
+              "regexp": "."
+            }
+          ],
+          "background": {
+            "activeOnStart": true,
+            "beginsPattern": "Flight Plan demo running on",
+            "endsPattern": "Server stopped\\.|^$"
+          }
+        }
+      ]
+    },
+    {
+      "label": "Demo: Stop server (kill node)",
+      "type": "shell",
+      "command": "taskkill",
+      "args": ["/F", "/IM", "node.exe"],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      },
+      "problemMatcher": []
+    }
+  ]
+}
